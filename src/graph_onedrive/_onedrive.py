@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
 import urllib.parse
 import warnings
@@ -14,6 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 from time import sleep
 from typing import Any
+from typing import AsyncGenerator
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -21,6 +23,7 @@ from typing import Tuple
 from typing import Union
 
 import aiofiles
+import dateutil.parser
 import httpx
 import requests
 
@@ -547,8 +550,29 @@ class OneDrive:
         # Return confirmation of deletion
         return True
 
+    def _set_creation_time(self, file_name: str, c_time: float, m_time: float) -> None:
+        if sys.platform == "win32":
+            from ctypes import windll, wintypes, byref
+
+            # Convert Unix timestamp to Windows FileTime using some magic numbers
+            # See documentation: https://support.microsoft.com/en-us/help/167296
+            c_timestamp = int((c_time * 10000000) + 116444736000000000)
+            win_ctime = wintypes.FILETIME(c_timestamp & 0xFFFFFFFF, c_timestamp >> 32)
+
+            m_timestamp = int((m_time * 10000000) + 116444736000000000)
+            win_mtime = wintypes.FILETIME(m_timestamp & 0xFFFFFFFF, m_timestamp >> 32)
+
+            # Call Win32 API to modify the file creation date
+            handle = windll.kernel32.CreateFileW(file_name, 256, 0, None, 3, 128, None)
+            windll.kernel32.SetFileTime(
+                handle, byref(win_ctime), None, byref(win_mtime)
+            )
+            windll.kernel32.CloseHandle(handle)
+        else:
+            os.utime(file_name, (m_time, m_time))
+
     @token_required
-    def download_file(self, item_id: str) -> str:
+    def download_file(self, item_id: str, copy_stats: bool = False) -> str:
         """Downloads the file to the current working directory. Note folders cannot be downloaded.
         Positional arguments:
             item_id (str) -- item id of the file to be deleted
@@ -557,6 +581,13 @@ class OneDrive:
         """
         # Get item details
         details = self.detail_item(item_id)
+        # Get times
+        created_datetime = details.get("fileSystemInfo", {}).get("createdDateTime", "")
+        last_modified_datetime = details.get("fileSystemInfo", {}).get(
+            "lastModifiedDateTime", ""
+        )
+        ctime = dateutil.parser.parse(created_datetime).timestamp()
+        mtime = dateutil.parser.parse(last_modified_datetime).timestamp()
         # Check that it is not a folder
         if "folder" in details:
             raise Exception(
@@ -578,10 +609,14 @@ class OneDrive:
         # Download the file
         file_name = details["name"]
         size = details["size"]
-        asyncio.run(self._download_async(download_url, file_name, size))
+        success = asyncio.run(self._download_async(download_url, file_name, size))
+        if success and copy_stats:
+            self._set_creation_time(file_name, ctime, mtime)
         return file_name
 
-    async def _download_async(self, download_url, file_name, size):
+    async def _download_async(
+        self, download_url: str, file_name: str, size: int
+    ) -> bool:
         """INTERNAL: Creates a list of coroutines each downloading one part of the file, and starts them"""
         co = list()
         file_part_names = list()
@@ -617,9 +652,13 @@ class OneDrive:
                 end = start + amount - 1
             # We append the coroutine call to the co list. Since we are not awaiting it yet,
             # it is not executed, just added to the list
-            co.append(self._download_part(f_name, start, end, download_url, s))
+            co.append(
+                asyncio.create_task(
+                    self._download_part(f_name, start, end, download_url, s)
+                )
+            )
         # This starts all the coroutines in the `co` list at once and waits for them all to return
-        await asyncio.gather(*co)
+        results = await asyncio.gather(*co)
         # Closing the httpx.AsyncClient instance
         await s.aclose()
         # We will join the downloaded file parts using shutil.copyfileobj()
@@ -631,28 +670,38 @@ class OneDrive:
                     fr.close()
                     file_part.unlink()
             fw.close()
+        return False not in results
 
     async def _download_part(
-        self, lf_name: Path, lstart, lend, ldownload_url, ls: httpx.AsyncClient
-    ):
+        self,
+        lf_name: Path,
+        lstart: int,
+        lend: int,
+        ldownload_url: str,
+        ls: httpx.AsyncClient,
+    ) -> bool:
         """INTERNAL: Downloads a single part of a file asynchronously"""
-        # Each coroutines opens its own file part to write into
-        async with aiofiles.open(lf_name, "wb") as fw:
-            # We build the Range HTTP header.
-            headers = {"Range": f"bytes={lstart}-{lend}"}
-            # Join the object headers (with auth infos)
-            headers.update(self._headers)
-            # Obtain the part number - just to be able to print something
-            part_name = lf_name.suffix.lstrip(".")
-            print("Starting part", part_name)
-            # Create an AsyncIterator over our GET request
-            async with ls.stream("GET", ldownload_url, headers=headers) as r:
-                # Iterates over incoming bytes in chunks of 64 * 1024 bytes
-                chunk_size = 64 * 1024
-                async for chunk in r.aiter_bytes(chunk_size):
-                    await fw.write(chunk)
-            await fw.close()
-            print("Part", part_name, "ended.")
+        try:
+            # Each coroutines opens its own file part to write into
+            async with aiofiles.open(lf_name, "wb") as fw:
+                # We build the Range HTTP header.
+                headers = {"Range": f"bytes={lstart}-{lend}"}
+                # Join the object headers (with auth infos)
+                headers.update(self._headers)
+                # Obtain the part number - just to be able to print something
+                part_name = lf_name.suffix.lstrip(".")
+                print("Starting part", part_name)
+                # Create an AsyncIterator over our GET request
+                async with ls.stream("GET", ldownload_url, headers=headers) as r:
+                    # Iterates over incoming bytes in chunks of 64 * 1024 bytes
+                    chunk_size = 64 * 1024
+                    async for chunk in r.aiter_bytes(chunk_size):
+                        await fw.write(chunk)
+                await fw.close()
+                print("Part", part_name, "ended.")
+                return True
+        except Exception as e:
+            return False
 
     @token_required
     def upload_file(
@@ -796,7 +845,7 @@ class OneDrive:
         upload_url = upload_url["uploadUrl"]
         # Determine the upload file size and chunks
         file_size = os.path.getsize(file_path)
-        chunk_size = 320 * 1024 * 10  # Has to be multiple of 320 kb
+        chunk_size = 320 * 1024 * 10 * 3  # Has to be multiple of 320 kb
         no_of_uploads = -(-file_size // chunk_size)
         content_range_start = 0
         if file_size < chunk_size:
@@ -874,3 +923,129 @@ class OneDrive:
         item_id = response_data["id"]
         # Return the file item id
         return item_id
+
+    @token_required
+    async def upload_large_file_2(
+        self,
+        file_path: Union[str, Path],
+        new_file_name: Optional[str] = None,
+        parent_folder_id: Optional[str] = None,
+        if_exists: str = "rename",
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Uploads a file in chunks to a particular folder with a provided file name.
+        Positional arguments:
+            file_path (str|Path) -- path of the file on the drive
+        Keyword arguments:
+            new_file_name (str) -- new name of the file as it should appear on OneDrive, without extension (default = None)
+            parent_folder_id (str) -- item id of the folder to put the file within, if None then root (default = None)
+            if_exists (str) -- action to take if the new folder already exists [fail, replace, rename] (default = "rename")
+        Returns:
+            item_id (str) -- item id of the newly uploaded file
+        """
+        # Set conflict behaviour
+        if if_exists == "fail":
+            conflict_behavior = "fail"
+        elif if_exists == "replace":
+            conflict_behavior = "replace"
+        elif if_exists == "rename":
+            conflict_behavior = "rename"
+        else:
+            raise Exception(
+                f"if_exists={if_exists} not valid. Str type of values 'fail', 'replace', 'rename', are only accepted."
+            )
+        # Ensure file_path is a Path type
+        if not isinstance(file_path, Path):
+            file_path = Path(file_path)
+        # Set file name
+        if new_file_name:
+            file_name = new_file_name
+        else:
+            file_name = file_path.name
+        # Create request url for the upload session
+        if parent_folder_id:
+            request_url = self._API_URL + "me/drive/items/" + parent_folder_id + ":/"
+        else:
+            request_url = self._API_URL + "me/drive/root:/"
+        request_url += file_name + ":/createUploadSession"
+        # Create request body for the upload session
+        body = {
+            "item": {
+                "@odata.type": "microsoft.graph.driveItemUploadableProperties",
+                "@microsoft.graph.conflictBehavior": conflict_behavior,
+            }
+        }
+        # Make the Graph API request for the upload session
+        print(f"Requesting upload session using url")
+        response = requests.post(request_url, headers=self._headers, json=body)
+        # Validate upload session request response and parse
+        if response.status_code != 200:
+            print(response.text)
+            raise Exception(
+                f"API Error {response.status_code}, could not upload file: {file_path}"
+            )
+        upload_url = json.loads(response.text)
+        upload_url = upload_url["uploadUrl"]
+        size = file_path.stat().st_size
+        # data = open(file_path, "rb")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), http2=True) as s:
+            # async with aiohttp.ClientSession() as s:
+            async with aiofiles.open(file_path, "rb") as data:
+                # with open(file_path, "rb", buffering=320 * 1024 * 20) as data:
+                amount = 320 * 1024 * 10 * 3  # Has to be multiple of 320 kb
+                parts = int(size / amount)
+                # amount = int(size / parts)
+                # If the file size is not an exact multiple of `parts`, `rest` will be > 0 and
+                # the part number is increased by one to allow the download of the last smaller piece
+                rest = size % amount
+                if rest > 0:
+                    parts += 1
+                async_gen = self._generator(data, amount, rest, parts)
+                for i in range(parts):
+                    if i % 10 == 0:
+                        percent = int(i / parts * 100)
+                        print(f"{i}/{parts}/{percent}%")
+                    # On first iteration will be 0
+                    start = amount * i
+                    # If this is the last part, the `end` will be set to the file size minus one
+                    # This is needed to handle the case `rest` is > 0.
+                    if i == parts - 1:
+                        end = size - 1
+                    else:
+                        end = start + amount - 1
+                    headers = {"Content-Range": f"bytes {start}-{end}/{size}"}
+                    # async_gen = self._generator(file_path, end-start+1, rest, parts)
+                    d = await async_gen.__anext__()
+                    # d = await data.read(end-start+1)
+                    r = await s.put(upload_url, headers=headers, content=d)
+                    # r = requests.put(upload_url, headers=headers, data=d)
+                    # r = await s.put(upload_url, headers=headers, data=async_gen)
+                    # await async_gen.aclose()
+                    if (
+                        r.status_code != 202
+                        and r.status_code != 201
+                        and r.status_code != 200
+                    ):
+                        # if r.status != 202 and r.status != 200:
+                        raise Exception(
+                            f"API Error {r.status_code}: could not upload chunk {i} of {parts}, {r.json()}"
+                        )
+                # data.close()
+            # await s.aclose()
+        response_data = json.loads(r.text)
+
+        item_id = response_data["id"]
+        # Return the file item id
+        return item_id, response_data
+
+    async def _generator(
+        self, data: Any, length: int, rest: int, parts: int
+    ) -> AsyncGenerator[bytes, None]:
+        # tot = 0
+        d = await data.read(length)
+        for i in range(parts):
+            if i == parts - 1 and rest > 0:
+                length = rest
+            # tot += len(d)
+            # print(tot, length)
+            yield d
+            d = await data.read(length)
