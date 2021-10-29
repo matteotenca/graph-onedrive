@@ -597,6 +597,34 @@ class OneDrive:
         return item_name
 
     @token_required
+    def change_timestamp(self, item_id: str, create_time: str, last_modified: str) -> Dict[str, Any]:
+        """
+
+        :param item_id:
+        :param create_time:
+        :param last_modified:
+        :return:
+        """
+        # Create request url based on input item id that should be renamed
+        request_url = self._API_URL + "me/drive/items/" + item_id
+        # Create the request body
+        body = {"fileSystemInfo": {"lastModifiedDateTime": last_modified, "createdDateTime": create_time}}
+        # Make the Graph API request
+        response = httpx.patch(request_url, headers=self._headers, json=body)
+        # Validate request response and parse
+        if response.status_code != 200:
+            try:
+                error = response.json()["error"]
+                error_message = error.get("message")
+            except:
+                error_message = ""
+            raise Exception(f"API Error : item not renamed ({error_message})")
+        response_data = response.json()
+        # item_name = response_data["name"]
+        # Return the item id and parent folder id
+        return response_data
+
+    @token_required
     def delete_item(self, item_id: str, pre_confirm: bool = False) -> bool:
         """Deletes an item (folder/file) within the connected OneDrive. Potentially restorable in the OneDrive web browser client.
         Positional arguments:
