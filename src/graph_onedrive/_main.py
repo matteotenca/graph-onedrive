@@ -7,6 +7,7 @@ from typing import Optional
 from typing import Union
 
 from graph_onedrive._onedrive import OneDrive
+from graph_onedrive._utils import get_creation_time, VersionCmp
 
 
 def create(

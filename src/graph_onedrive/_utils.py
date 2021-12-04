@@ -1,10 +1,13 @@
 import datetime
 import os
+import platform
 import typing
 from ctypes import *
+import re
 
 # int statx(int dirfd, const char *restrict pathname, int flags,
 #           unsigned int mask, struct statx *restrict statxbuf);
+# import graph_onedrive
 
 
 class StatxTimestamp(Structure):
@@ -44,7 +47,7 @@ class StatxStruct(Structure):
 AT_FDCWD = (
     -100
 )  # Special value used to indicate openat should use the current working directory.
-AT_SYMLINK_NOFOLLOW = 0x100  # Do not follow symbolic links.
+AT_SYMLINK_NOFOLLOW = c_uint32(0x100)  # Do not follow symbolic links.
 AT_EACCESS = 0x200  # Test access permitted for effective IDs, not real IDs.
 AT_REMOVEDIR = 0x200  # Remove directory instead of unlinking file.
 AT_SYMLINK_FOLLOW = 0x400  # Follow symbolic links.
@@ -60,14 +63,14 @@ STATX_MODE = 0x00000002  # Want/got stx_mode & ~S_IFMT
 STATX_NLINK = 0x00000004  # Want/got stx_nlink
 STATX_UID = 0x00000008  # Want/got stx_uid
 STATX_GID = 0x00000010  # Want/got stx_gid
-STATX_ATIME = 0x00000020  # Want/got stx_atime
-STATX_MTIME = 0x00000040  # Want/got stx_mtime
-STATX_CTIME = 0x00000080  # Want/got stx_ctime
+STATX_ATIME = c_uint32(0x00000020)  # Want/got stx_atime
+STATX_MTIME = c_uint32(0x00000040)  # Want/got stx_mtime
+STATX_CTIME = c_uint32(0x00000080)  # Want/got stx_ctime
 STATX_INO = 0x00000100  # Want/got stx_ino
 STATX_SIZE = 0x00000200  # Want/got stx_size
 STATX_BLOCKS = 0x00000400  # Want/got stx_blocks
-STATX_BASIC_STATS = 0x000007FF  # The stuff in the normal stat struct
-STATX_BTIME = 0x00000800  # Want/got stx_btime
+STATX_BASIC_STATS = c_uint32(0x000007FF)  # The stuff in the normal stat struct
+STATX_BTIME = c_uint32(0x00000800)  # Want/got stx_btime
 STATX_MNT_ID = 0x00001000  # Got stx_mnt_id
 
 STATX__RESERVED = 0x80000000  # Reserved for future struct statx expansion
@@ -100,17 +103,29 @@ STATX_ATTR_VERITY = 0x00100000  # [I] Verity protected file
 STATX_ATTR_DAX = 0x00200000  # File is currently in DAX state
 
 
-def _get_creation_time(file_name: str) -> typing.Union[typing.List[int], None]:
-    if os.name != "posix":
+def get_creation_time(file_name: str) -> typing.Union[typing.List[int], None]:
+    if platform.system() != "Linux":
         return None
+    else:
+        match = re.search(r"^[\d.]+", platform.release())
+        if match:
+            kernel_version = match.group(0)
+            if VersionCmp(kernel_version) < VersionCmp("4.11"):
+                return None
     libc = cdll.LoadLibrary("libc.so.6")
+    gnu_get_libc_version = libc.gnu_get_libc_version
+    gnu_get_libc_version.restype = c_char_p
+    libc_version: bytes = gnu_get_libc_version()
+    if VersionCmp(libc_version.decode(encoding="utf-8")) < VersionCmp("2.28"):
+        return None
     statx = libc.statx
     # statx.argtypes = [c_int, c_char, c_int, c_uint, POINTER(StatxStruct)]
     statx.restype = c_int
     # statx_proto = CFUNCTYPE(c_int, c_int, c_char_p, c_int, c_uint, POINTER(StatxStruct))
     statx_buf = StatxStruct()
-    file_name_bin = create_string_buffer(file_name.encode(encoding="ascii"))
-    mask = STATX_ATIME | STATX_MTIME | STATX_CTIME | STATX_BTIME | STATX_BASIC_STATS
+    file_name_bin = create_unicode_buffer(file_name)
+    # mask = c_uint32(STATX_ATIME.value | STATX_MTIME.value | STATX_CTIME.value | STATX_BTIME.value | STATX_BASIC_STATS.value)
+    mask = c_uint32(STATX_ALL)
     # print(f"mask: {hex(mask)}")
     result = statx(0, byref(file_name_bin), 0, mask, byref(statx_buf))
     values = list()
@@ -124,21 +139,118 @@ def _get_creation_time(file_name: str) -> typing.Union[typing.List[int], None]:
         values.append(ctime)
         values.append(mtime)
         print(
-            atime,
+            atime, "Access",
             datetime.datetime.fromtimestamp(atime).strftime("%Y-%m-%dT%H:%M:%S.%f"),
         )
         print(
-            btime,
+            btime, "Birth",
             datetime.datetime.fromtimestamp(btime).strftime("%Y-%m-%dT%H:%M:%S.%f"),
         )
         print(
-            ctime,
+            ctime, "Change",
             datetime.datetime.fromtimestamp(ctime).strftime("%Y-%m-%dT%H:%M:%S.%f"),
         )
         print(
-            mtime,
+            mtime, "Modified",
             datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S.%f"),
         )
         return values
     else:
         return None
+
+
+class VersionCmp:
+
+    _num_split_re = re.compile(r'([0-9]+|[^0-9]+)')
+    _ver_list = list()
+    _ver_str = str()
+
+    def __init__(self, ver: typing.Union[str, object]) -> None:
+        if isinstance(ver, str):
+            self._ver_str: str = ver
+            self._ver_list: list = self._ver_as_list(ver)
+        else:
+            self._ver_list: list = ver._ver_list
+            self._ver_str: str = ver._ver_str
+
+    def _try_int(self, i: str, fallback=None) -> typing.Union[int, str]:
+        try:
+            q = int(i)
+            return int(i)
+        except ValueError:
+            pass
+        except TypeError:
+            pass
+        return fallback
+
+    def _ver_as_list(self, ver: typing.Union[str, typing.Any]) -> typing.List:
+        if isinstance(ver, str):
+            ll = [self._try_int(i, i) for i in self._num_split_re.findall(ver)]
+            return ll
+        elif isinstance(ver, type(self)):
+            return ver._ver_list
+        else:
+            raise TypeError()
+
+    def __lt__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list < other_ls
+
+    def __le__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list <= other_ls
+
+    def __eq__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list == other_ls
+
+    def __ne__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list != other_ls
+
+    def __gt__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list > other_ls
+
+    def __ge__(self, other: typing.Union[str, typing.Any]) -> bool:
+        if isinstance(other, str):
+            other_ls = self._ver_as_list(other)
+        elif isinstance(other, type(self)):
+            other_ls = other._ver_list
+        else:
+            raise TypeError()
+        return self._ver_list >= other_ls
+
+    def __str__(self) -> str:
+        return self._ver_str
+
+    def __bytes__(self) -> bytes:
+        return self._ver_str.encode(encoding="utf-8")
+
+    def __repr__(self) -> str:
+        return self._ver_str.__repr__()
