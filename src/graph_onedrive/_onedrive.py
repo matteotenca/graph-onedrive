@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import os
 import re
@@ -19,7 +21,6 @@ from json.decoder import JSONDecodeError
 from pathlib import Path
 from time import sleep
 from typing import Any
-from typing import Optional
 
 import aiofiles
 import httpx
@@ -28,7 +29,6 @@ from graph_onedrive.__init__ import __version__
 from graph_onedrive._config import dump_config
 from graph_onedrive._config import load_config
 from graph_onedrive._decorators import token_required
-
 
 # Set logger
 logger = logging.getLogger(__name__)
@@ -40,6 +40,7 @@ class GraphAPIError(Exception):
     pass
 
 
+# noinspection PyUnreachableCode
 class OneDrive:
     """Creates an instance to interact with Microsoft's OneDrive platform through their Graph API.
     Positional arguments:
@@ -465,13 +466,27 @@ class OneDrive:
         return used, capacity, unit
 
     @token_required
+    def get_root(self, verbose: bool = False) -> str:
+        request_url = self._api_drive_url + "root"
+        response = httpx.get(request_url, headers=self._headers)
+        self._raise_unexpected_response(
+            response, 200, "directory could not be listed", has_json=True
+        )
+        response_data = response.json()
+        root_id = response_data.get('id', 'Unknown!')
+        if verbose:
+            print(f"Root ID: {root_id}")
+        return root_id
+
+    @token_required
     def list_directory(
-        self, folder_id: str | None = None, verbose: bool = False
+            self, folder_id: str | None = None, verbose: bool = False, recursive: bool = False
     ) -> list[dict[str, object]]:
         """List the files and folders within the input folder/root of the connected OneDrive.
         Keyword arguments:
             folder_id (str) -- the item id of the folder to look into, None being the root directory (default = None)
             verbose (bool) -- print the items along with their ids (default = False)
+            recursive (bool) -- recurse into subfolders (default = False)
         Returns:
             items (dict) -- details of all the items within the requested directory
         """
@@ -494,7 +509,14 @@ class OneDrive:
             )
             response_data = response.json()
             # Add the items to the item list
-            items_list += response_data.get("value", {})
+            for item in response_data.get("value", {}):
+                if "file" in item:
+                    items_list.append(item)
+                elif "folder" in item:
+                    if recursive:
+                        children = self.list_directory(item["id"], verbose=verbose, recursive=recursive)
+                        item["children"] = children
+                    items_list.append(item)
             # Break if these is no next link, else set the request link
             if response_data.get("@odata.nextLink") is None:
                 break
@@ -503,7 +525,8 @@ class OneDrive:
         # Print the items in the directory along with their item ids
         if verbose:
             for item in items_list:
-                print(item["id"], item["name"])
+                print(item["id"], "folder" if "file" not in item.keys() else " file ",
+                      item["parentReference"]["path"][12:] + "/" + item["name"], item["size"])
         # Return the items dictionary
         return items_list
 
@@ -1047,6 +1070,296 @@ class OneDrive:
         return True
 
     @token_required
+    def download_simple(
+            self,
+            item_id: str,
+            dest_dir: str | Path | None = None,
+            verbose: bool = False,
+    ) -> str:
+        # Validate dest_dir
+        if dest_dir is None:
+            dest_dir = Path.cwd()
+        elif not isinstance(dest_dir, str) and not isinstance(dest_dir, Path):
+            raise TypeError(
+                f"dest_dir expected 'str' or 'Path', got {type(dest_dir).__name__!r}"
+            )
+        dest_dir = Path(dest_dir)
+        if not dest_dir.is_dir():
+            raise ValueError(f"dest_dir {dest_dir} is not a directory")
+        # Get item details
+        file_details = self.detail_item(item_id)
+        # Check that it is not a folder
+        if "folder" in file_details:
+            raise ValueError("item_id provided is for a folder, expected file item id")
+        file_name = file_details["name"]
+        file_path = dest_dir / file_name
+        size = file_details["size"]
+        # If the file is empty, just create it and return
+        if size == 0:
+            file_path.touch()
+            logger.warning(f"downloaded file size=0, empty file '{file_name}' created.")
+            return file_name
+        # Create request url based on input item id to be downloaded
+        request_url = self._api_drive_url + "items/" + item_id + "/content"
+        # Make the Graph API request
+        if verbose:
+            print("Getting the file download url")
+        with open(file_path, "wb") as fw:
+            response = httpx.get(request_url, headers=self._headers, follow_redirects=True)
+
+            self._raise_unexpected_response(
+                response, [200], "item not downloaded"
+            )
+            write_chunk_size = 64 * 1024  # 64 KiB
+            for chunk in response.iter_bytes(write_chunk_size):
+                fw.write(chunk)
+        response.close()
+        return file_path
+
+    @token_required
+    def download_dir(self, dir_id: str, dest_dir: str | Path, verbose: bool = False) -> None:
+        download_list = []
+
+        def download_t(children, directory):
+            for item in children:
+                if "file" in item:
+                    d = {"id": item["id"], "name": item["name"], "size": item["size"], "dest_dir": directory,
+                         "download_url": self._api_drive_url + "items/" + item["id"] + "/content"}
+                    download_list.append(d)
+                if "folder" in item:
+                    new_dir = directory.joinpath(item["name"])
+                    new_dir.mkdir(parents=True, exist_ok=True)
+                    download_t(item["children"], new_dir)
+
+        tree = self.list_directory(dir_id, verbose=False, recursive=True)
+        details = self.detail_item(dir_id)
+        top = Path(dest_dir).joinpath(details["name"])
+        top.mkdir(parents=True, exist_ok=True)
+        download_t(tree, top)
+        asyncio.run(
+            self._download_many_async(download_list, verbose=verbose)
+        )
+
+    async def _download_many_async(self, tree: list[dict[str, str | Path]], verbose: bool = False) -> None:
+        timeout = httpx.Timeout(10.0, read=180.0)
+        client = httpx.AsyncClient(timeout=timeout)
+        tasks = []
+        i = 0
+        for item in tree:
+            tasks.append(
+                asyncio.create_task(
+                    self._download_async_file(
+                        client,
+                        item["download_url"],
+                        item["name"],
+                        item["size"],
+                        item["dest_dir"],
+                        verbose=verbose,
+                    )
+                )
+            )
+            i += 1
+            if len(tasks) == 32:
+                if verbose:
+                    print(f"Task list len: {len(tasks)}")
+                await asyncio.gather(*tasks)
+                tasks.clear()
+        if verbose:
+            print(f"Last task list len: {len(tasks)}")
+        # This awaits all the tasks in the `task` list to return
+        await asyncio.gather(*tasks)
+        # Closing the httpx.AsyncClient instance
+        await client.aclose()
+        if verbose:
+            print(f"Total files downloaded: {i}")
+
+    async def _download_async_file(self, client, url, name, size, dest_dir, verbose: bool = False) -> None:
+        path = dest_dir / name
+        buf = 256 * 1024
+        async with aiofiles.open(path, "wb", buffering=buf) as fw:
+            if verbose:
+                print(
+                    f"Starting download of file {name} (bytes {size})"
+                )
+            logger.debug(
+                f"Starting download of file {name} (bytes {size})"
+            )
+            # Create an AsyncIterator over our GET request
+            async with client.stream("GET", url, headers=self._headers, follow_redirects=True) as response:
+                # Iterates over incoming bytes in chunks and saves them to file
+                self._raise_unexpected_response(
+                    response, [200, 206], "item not downloaded"
+                )
+                write_chunk_size = 64 * 1024  # 64 KiB
+                async for chunk in response.aiter_bytes(write_chunk_size):
+                    await fw.write(chunk)
+
+    @token_required
+    def download_file_tasks(
+            self,
+            item_id: str,
+            max_connections: int = 8,
+            dest_dir: str | Path | None = None,
+            verbose: bool = False,
+    ) -> str:
+        """Downloads a file to the current working directory asynchronously via a ThreadPoolExecutor.
+        Note folders cannot be downloaded, you need to use a loop instead.
+        Positional arguments:
+            item_id (str) -- item id of the file to be downloaded
+        Keyword arguments:
+            max_connections (int) -- max concurrent open http requests, refer Docs regarding throttling limits
+            dest_dir (str | Path) -- destination directory for the downloaded file, default is current working directory (default = None)
+            verbose (bool) -- prints status message during the download process (default = False)
+        Returns:
+            file_path (Path) -- returns the path of the file including extension
+        """
+        # Validate item_id
+        if not isinstance(item_id, str):
+            raise TypeError(f"item_id expected 'str', got {type(item_id).__name__!r}")
+        # Validate max_connections
+        if not isinstance(max_connections, int):
+            raise TypeError(
+                f"max_connections expected 'int', got {type(max_connections).__name__!r}"
+            )
+        # Validate dest_dir
+        if dest_dir is None:
+            dest_dir = Path.cwd()
+        elif not isinstance(dest_dir, str) and not isinstance(dest_dir, Path):
+            raise TypeError(
+                f"dest_dir expected 'str' or 'Path', got {type(dest_dir).__name__!r}"
+            )
+        dest_dir = Path(dest_dir).absolute()
+        if not dest_dir.is_dir():
+            raise ValueError(f"dest_dir {dest_dir} is not a directory")
+        # Check max connections is not excessive
+        if max_connections > 16:
+            warnings.warn(
+                f"max_connections={max_connections} could result in throttling and enforced cool-down period",
+                stacklevel=2,
+            )
+        # Get item details
+        file_details = self.detail_item(item_id)
+        # Check that it is not a folder
+        if "folder" in file_details:
+            raise ValueError("item_id provided is for a folder, expected file item id")
+        file_name = file_details["name"]
+        file_path = dest_dir / file_name
+        size = file_details["size"]
+        # If the file is empty, just create it and return
+        if size == 0:
+            file_path.touch()
+            logger.warning(f"downloaded file size=0, empty file '{file_name}' created.")
+            return file_name
+        # Create request url based on input item id to be downloaded
+        download_url = self._api_drive_url + "items/" + item_id + "/content"
+        if verbose:
+            print("Getting the file download url")
+        logger.debug(f"download_url={download_url}")
+
+        tasks = list()
+        file_part_names = list()
+        # Creates a new temp directory via tempfile.TemporaryDirectory()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Min chunk size, used to calculate the  number of concurrent connections based on file size
+            min_typ_chunk_size = 1 * 1024 * 1024  # 1 MiB
+            # Effective number of concurrent connections
+            num_coroutines = size // (2 * min_typ_chunk_size) + 1
+            # Assures the max number of co-routines/concurrent connections is equal to the provided one
+            if num_coroutines > max_connections:
+                num_coroutines = max_connections
+            # Calculates the final size of the chunk that each co-routine will download
+            typ_chunk_size = size // num_coroutines
+            if verbose:
+                pretty_size = round(size / 1000000, 1)
+                print(
+                    f"File {file_path.name} ({pretty_size}mb) will be downloaded in {num_coroutines} segments."
+                )
+            logger.debug(
+                f"file_size={size}B, min_typ_chunk_size={min_typ_chunk_size}B, num_coroutines={num_coroutines}, typ_chunk_size={typ_chunk_size}"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_coroutines) as executor:
+                for i in range(num_coroutines):
+                    # Get the file part Path, placed in the temp directory
+                    part_file_path = Path(tmp_dir).joinpath(
+                        file_path.name + "." + str(i + 1)
+                    )
+                    # We save the file part Path for later use
+                    file_part_names.append(part_file_path)
+                    # On first iteration will be 0
+                    start = typ_chunk_size * i
+                    # If this is the last part, the `end` will be set to the file size minus one
+                    # This is needed to be sure we download the entire file.
+                    if i == num_coroutines - 1:
+                        end = size - 1
+                    else:
+                        end = start + typ_chunk_size - 1
+                    # We create a set of arguments and append it to the `task` list.
+                    tasks.append([download_url, part_file_path, start, end, verbose, i])
+
+                start_time = datetime.now().timestamp()
+                future_to_url = {executor.submit(self._download_part_task, *args): args[5] for args in tasks}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    part = future_to_url[future]
+                    try:
+                        data = future.result()
+                    except Exception as exc:
+                        print('%r generated an exception: %s' % (part, exc))
+                    else:
+                        print(f"{data}")
+
+                end = datetime.now().timestamp()
+                duration_secs = end - start_time
+                speed = round(size / 1024 / 1024 / duration_secs, 2)
+                # Join the downloaded file parts
+                if verbose:
+                    print(f"Speed: {speed:n} MB/second")
+                    print("Joining individual segments into single file")
+                with open(file_path, "wb") as fw:
+                    for file_part in file_part_names:
+                        with open(file_part, "rb") as fr:
+                            shutil.copyfileobj(fr, fw)
+                        file_part.unlink()
+        return f"{file_path}"
+
+    def _download_part_task(
+            self,
+            # client: httpx.AsyncClient,
+            download_url: str,
+            part_file_path: Path,
+            start: int,
+            end: int,
+            verbose: bool = False,
+            i: int = -1
+    ) -> str:
+        # Each task opens its own file part to write into
+        with open(part_file_path, "wb") as fw:
+            # Build the Range HTTP header and add the auth header
+            headers = {"Range": f"bytes={start}-{end}"}
+            headers.update(self._headers)
+            part_name = part_file_path.suffix.lstrip(".")
+            if verbose:
+                print(
+                    f"Starting download of file segment {part_name} (bytes {start}-{end})"
+                )
+            logger.debug(
+                f"starting download segment={part_name} start={start} end={end}"
+            )
+            timeout = httpx.Timeout(10.0, read=180.0)
+            client = httpx.Client(timeout=timeout)
+            # Create an Iterator over our GET request
+            with client.stream("GET", download_url, headers=headers, follow_redirects=True) as response:
+                # Iterates over incoming bytes in chunks and saves them to file
+                self._raise_unexpected_response(
+                    response, [200, 206], "item not downloaded"
+                )
+                write_chunk_size = 64 * 1024  # 64 KiB
+                for chunk in response.iter_bytes(write_chunk_size):
+                    fw.write(chunk)
+            client.close()
+            logger.debug(f"finished download segment={part_name}")
+        return f"Finished download of file segment {part_name}"
+
+    @token_required
     def download_file(
         self,
         item_id: str,
@@ -1103,14 +1416,10 @@ class OneDrive:
             logger.warning(f"downloaded file size=0, empty file '{file_name}' created.")
             return file_name
         # Create request url based on input item id to be downloaded
-        request_url = self._api_drive_url + "items/" + item_id + "/content"
+        download_url = self._api_drive_url + "items/" + item_id + "/content"
         # Make the Graph API request
         if verbose:
             print("Getting the file download url")
-        response = httpx.get(request_url, headers=self._headers)
-        # Validate request response and parse
-        self._raise_unexpected_response(response, 302, "could not get download url")
-        download_url = response.headers["Location"]
         logger.debug(f"download_url={download_url}")
         # Download the file asynchronously
         asyncio.run(
@@ -1190,12 +1499,17 @@ class OneDrive:
                         )
                     )
                 )
+            start_time = datetime.now().timestamp()
             # This awaits all the tasks in the `task` list to return
             await asyncio.gather(*tasks)
+            end = datetime.now().timestamp()
+            duration_secs = end - start_time
+            speed = round(file_size / 1024 / 1024 / duration_secs, 2)
             # Closing the httpx.AsyncClient instance
             await client.aclose()
             # Join the downloaded file parts
             if verbose:
+                print(f"Speed: {speed:n} MB/second")
                 print("Joining individual segments into single file")
             with open(file_path, "wb") as fw:
                 for file_part in file_part_names:
@@ -1236,7 +1550,7 @@ class OneDrive:
                 f"starting download segment={part_name} start={start} end={end}"
             )
             # Create an AsyncIterator over our GET request
-            async with client.stream("GET", download_url, headers=headers) as response:
+            async with client.stream("GET", download_url, headers=headers, follow_redirects=True) as response:
                 # Iterates over incoming bytes in chunks and saves them to file
                 self._raise_unexpected_response(
                     response, [200, 206], "item not downloaded"
